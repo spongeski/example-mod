@@ -23,11 +23,11 @@
 // "Frames" are 240 Hz physics steps. Only tap-style modes are buffered (cube, ball,
 // UFO, spider); ship / wave / swing / robot clicks are left completely untouched.
 // ---------------------------------------------------------------------------
-
+ 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-
+ 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -36,11 +36,11 @@
 #include <random>
 #include <string>
 #include <vector>
-
+ 
 using namespace geode::prelude;
-
+ 
 namespace {
-
+ 
 // ----- tuning knobs ---------------------------------------------------------
 constexpr double TPS = 240.0;          // physics steps per second (stock GD)
 constexpr int HORIZON = 110;           // how many frames ahead each lookahead simulation runs
@@ -50,7 +50,7 @@ constexpr int SCORE_TOL = 3;           // tolerance when comparing "frames survi
 constexpr int MAX_WINDOW_SCAN = 2;     // look at most MAX_WINDOW_SCAN * N frames past `a` for the end of the window
 constexpr double MEAN_FRAC = 0.40;     // 0 = earliest frame of window, 0.5 = dead middle. "early-middle" = 0.4
 constexpr double SPREAD_FRAC = 0.20;   // randomness of the landing spot (fraction of the window width)
-
+ 
 // ----- settings -------------------------------------------------------------
 bool bufferEnabled() { return Mod::get()->getSettingValue<bool>("enabled"); }
 bool blockSaving() { return Mod::get()->getSettingValue<bool>("block-saving"); }
@@ -60,38 +60,39 @@ int windowFrames() {
     try { n = std::stoi(Mod::get()->getSettingValue<std::string>("window")); } catch (...) {}
     return std::clamp(n, 1, 64);
 }
-
+ 
 // ----- state ----------------------------------------------------------------
 struct Event {
     int step;     // game step (frame) on which to apply it
     bool down;
     bool p1;
 };
-
+ 
 struct State {
     std::deque<Event> sched;   // buffered clicks waiting for their frame (sorted by step)
     double owed = 0.0;         // time we've taken from the engine while stepping manually
     int lastStep[2] = {-1000000, -1000000};
     int lastDelay[2] = {0, 0};
-
+ 
     bool simulating = false;
+    bool firing = false;       // true while WE are applying a buffered click (so our hook lets it through)
     bool simDied = false;
     int simDeathFrame = -1;
-
+ 
     int retimed = 0;
     std::mt19937 rng{std::random_device{}()};
 };
-
+ 
 State& st() {
     static State s;
     return s;
 }
-
+ 
 int frameOf(GJBaseGameLayer* l) {
     // NOTE: assumes m_gameState.m_levelTime exists and counts seconds of level time.
     return static_cast<int>(std::llround(l->m_gameState.m_levelTime * TPS));
 }
-
+ 
 void resetRuntime() {
     auto& g = st();
     g.sched.clear();
@@ -99,7 +100,7 @@ void resetRuntime() {
     g.lastStep[0] = g.lastStep[1] = -1000000;
     g.lastDelay[0] = g.lastDelay[1] = 0;
 }
-
+ 
 PlayLayer* livePlay(GJBaseGameLayer* layer) {
     if (st().simulating || !bufferEnabled()) return nullptr;
     auto pl = PlayLayer::get();
@@ -109,19 +110,19 @@ PlayLayer* livePlay(GJBaseGameLayer* layer) {
     if (pl->m_player1 && pl->m_player1->m_isDead) return nullptr;
     return pl;
 }
-
+ 
 bool tapMode(PlayLayer* pl) {
     auto p = pl->m_player1;
     if (!p) return false;
     return !(p->m_isShip || p->m_isDart || p->m_isSwing || p->m_isRobot);
 }
-
+ 
 void addEvent(Event e) {
     auto& q = st().sched;
     auto it = std::upper_bound(q.begin(), q.end(), e, [](Event const& x, Event const& y) { return x.step < y.step; });
     q.insert(it, e);
 }
-
+ 
 // Apply every buffered event that is due. Called between physics steps.
 void fireDue(PlayLayer* pl) {
     auto& g = st();
@@ -129,10 +130,12 @@ void fireDue(PlayLayer* pl) {
     while (!g.sched.empty() && g.sched.front().step <= k) {
         Event e = g.sched.front();
         g.sched.pop_front();
+        g.firing = true;
         pl->handleButton(e.down, 1, e.p1);
+        g.firing = false;
     }
 }
-
+ 
 // Pick the frame inside [a, b] the click is released on.
 // early = how many frames before the true window the player clicked (1..N).
 int pickTarget(int a, int b, int early, int N) {
@@ -149,7 +152,7 @@ int pickTarget(int a, int b, int early, int N) {
     }
     return std::clamp(static_cast<int>(std::llround(mean)), a, b);
 }
-
+ 
 // ----- lookahead simulation -------------------------------------------------
 // Restore the snapshot, apply `evs` at their frames, run up to `horizon` frames.
 // Returns how many frames the player survived (== horizon if it never died).
@@ -158,10 +161,10 @@ int simulate(PlayLayer* pl, CheckpointObject* cp, double t0, int c0, std::vector
     g.simulating = true;
     g.simDied = false;
     g.simDeathFrame = -1;
-
+ 
     pl->loadFromCheckpoint(cp);
     pl->m_gameState.m_levelTime = t0;
-
+ 
     size_t i = 0;
     for (int guard = 0; guard < horizon * 4 && !g.simDied && frameOf(pl) < c0 + horizon; ++guard) {
         int k = frameOf(pl);
@@ -169,29 +172,29 @@ int simulate(PlayLayer* pl, CheckpointObject* cp, double t0, int c0, std::vector
             pl->handleButton(evs[i].down, 1, evs[i].p1);
         pl->update(1.f / static_cast<float>(TPS));  // our update hook passes straight through while simulating
     }
-
+ 
     g.simulating = false;
     return g.simDied ? std::max(0, g.simDeathFrame - c0) : horizon;
 }
-
+ 
 // How many frames should the click that just arrived be delayed? (0 = leave it alone)
 int planDelay(PlayLayer* pl, bool p1) {
     auto& g = st();
     const int N = windowFrames();
     const int H = HORIZON;
     const int c0 = frameOf(pl);
-
+ 
     CheckpointObject* cp = pl->createCheckpoint();
     if (!cp) return 0;
     cp->retain();
     const double t0 = pl->m_gameState.m_levelTime;
-
+ 
     const auto start = std::chrono::steady_clock::now();
     const double budget = lookaheadMs();
     auto outOfTime = [&]() {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budget;
     };
-
+ 
     std::vector<Event> base(g.sched.begin(), g.sched.end());
     auto run = [&](int d) {
         auto ev = base;
@@ -200,12 +203,12 @@ int planDelay(PlayLayer* pl, bool p1) {
         std::stable_sort(ev.begin(), ev.end(), [](Event const& x, Event const& y) { return x.step < y.step; });
         return simulate(pl, cp, t0, c0, ev, H);
     };
-
+ 
     int result = 0;
     do {
         int s0 = run(0);
         if (s0 >= H) break;  // clicking right now is already fine
-
+ 
         // Phase 1: first delay (within the buffer window) that works.
         std::vector<int> sc(N + 1, 0);
         int a = -1;
@@ -221,7 +224,7 @@ int planDelay(PlayLayer* pl, bool p1) {
             log::debug("lookahead ran out of time, click left alone");
             break;
         }
-
+ 
         // If nothing survives the whole horizon (e.g. a later obstacle needs another click),
         // fall back to "the delays that survive longest".
         int threshold = H;
@@ -232,7 +235,7 @@ int planDelay(PlayLayer* pl, bool p1) {
                 if (sc[d] >= threshold) { a = d; break; }
             if (a < 0) break;
         }
-
+ 
         // Phase 2: find where the window ends.
         int b = a;
         for (int d = a + 1; d <= a + MAX_WINDOW_SCAN * N; ++d) {
@@ -240,18 +243,18 @@ int planDelay(PlayLayer* pl, bool p1) {
             if (run(d) >= threshold) b = d;
             else break;
         }
-
+ 
         result = pickTarget(a, b, a, N);
         log::debug("buffered click: window {}..{} frames after click, released on +{} (N={})", a, b, result, N);
     } while (false);
-
+ 
     // Put the live game back exactly where it was before the lookahead.
     pl->loadFromCheckpoint(cp);
     pl->m_gameState.m_levelTime = t0;
     cp->release();
     return result;
 }
-
+ 
 // ----- UI -------------------------------------------------------------------
 void refreshLabel(PlayLayer* pl) {
     if (!pl || !pl->m_uiLayer) return;
@@ -268,7 +271,7 @@ void refreshLabel(PlayLayer* pl) {
         label->setColor({255, 255, 255});
     }
 }
-
+ 
 void showBanner() {
     auto scene = CCDirector::get()->getRunningScene();
     if (!scene) return;
@@ -281,13 +284,13 @@ void showBanner() {
     l->setPosition({win.width / 2, win.height - 40});
     scene->addChild(l, 99999);
 }
-
+ 
 // ----- click handling -------------------------------------------------------
 void onPress(PlayLayer* pl, bool p1) {
     auto& g = st();
     int idx = p1 ? 0 : 1;
     int c0 = frameOf(pl);
-
+ 
     int delay = 0;
     if (g.lastStep[idx] >= c0) {
         // an earlier buffered click for this player is still pending: just queue behind it
@@ -295,17 +298,17 @@ void onPress(PlayLayer* pl, bool p1) {
     } else if (tapMode(pl)) {
         delay = planDelay(pl, p1);
     }
-
+ 
     g.lastDelay[idx] = delay;
     g.lastStep[idx] = c0 + delay;
     addEvent({c0 + delay, true, p1});
-
+ 
     if (delay > 0) {
         g.retimed++;
         refreshLabel(pl);
     }
 }
-
+ 
 void onRelease(PlayLayer* pl, bool p1) {
     auto& g = st();
     int idx = p1 ? 0 : 1;
@@ -315,33 +318,31 @@ void onRelease(PlayLayer* pl, bool p1) {
     g.lastStep[idx] = step;
     addEvent({step, false, p1});
 }
-
+ 
 }  // namespace
-
+ 
 // ============================================================================
 // Intercept jump clicks
 // ============================================================================
 class $modify(BufferBGL, GJBaseGameLayer) {
-    // NOTE: the bool is passed straight through; it's treated as "isPlayer1" like handleButton's.
-    void pushButton(int button, bool flag) {
-        auto pl = (button == 1) ? livePlay(this) : nullptr;
-        if (!pl || (!tapMode(pl) && st().sched.empty())) {
-            GJBaseGameLayer::pushButton(button, flag);
+    // handleButton(down, button, isPlayer1) is where the game applies every jump press / release.
+    // (pushButton / releaseButton no longer exist on GJBaseGameLayer in current bindings.)
+    void handleButton(bool down, int button, bool isPlayer1) {
+        // Our own scheduled clicks, lookahead simulations and non-jump buttons pass straight through.
+        if (st().firing || button != 1) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
-        onPress(pl, flag);
-    }
-
-    void releaseButton(int button, bool flag) {
-        auto pl = (button == 1) ? livePlay(this) : nullptr;
+        auto pl = livePlay(this);
         if (!pl || (!tapMode(pl) && st().sched.empty())) {
-            GJBaseGameLayer::releaseButton(button, flag);
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
-        onRelease(pl, flag);
+        if (down) onPress(pl, isPlayer1);
+        else onRelease(pl, isPlayer1);
     }
 };
-
+ 
 // ============================================================================
 // Step-accurate release of buffered clicks + UI
 // ============================================================================
@@ -351,7 +352,7 @@ class $modify(BufferPL, PlayLayer) {
         resetRuntime();
         st().retimed = 0;
         if (!bufferEnabled()) return;
-
+ 
         auto win = CCDirector::get()->getWinSize();
         std::string text = "CLICK BUFFER (" + std::to_string(windowFrames()) + "F) - NOT A REAL RUN";
         auto label = CCLabelBMFont::create(text.c_str(), "bigFont.fnt");
@@ -361,7 +362,7 @@ class $modify(BufferPL, PlayLayer) {
         label->setPosition({win.width / 2, win.height - 10});
         m_uiLayer->addChild(label, 100);
     }
-
+ 
     void resetLevel() {
         PlayLayer::resetLevel();
         if (st().simulating) return;
@@ -372,12 +373,12 @@ class $modify(BufferPL, PlayLayer) {
         }
         if (auto scene = CCDirector::get()->getRunningScene()) scene->removeChildByID("assist-banner"_spr);
     }
-
+ 
     void onQuit() {
         resetRuntime();
         PlayLayer::onQuit();
     }
-
+ 
     // Only used to detect death inside lookahead simulations. Real deaths are untouched.
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         auto& g = st();
@@ -391,7 +392,7 @@ class $modify(BufferPL, PlayLayer) {
         resetRuntime();  // dead players don't need buffered clicks
         PlayLayer::destroyPlayer(player, object);
     }
-
+ 
     void update(float dt) {
         auto& g = st();
         if (g.simulating) {
@@ -399,7 +400,7 @@ class $modify(BufferPL, PlayLayer) {
             return;
         }
         if (!bufferEnabled()) g.sched.clear();
-
+ 
         if (g.sched.empty()) {
             // normal frame: hand back any time we were holding and run as usual
             dt += static_cast<float>(g.owed);
@@ -407,7 +408,7 @@ class $modify(BufferPL, PlayLayer) {
             PlayLayer::update(dt);
             return;
         }
-
+ 
         // A click is buffered: advance one physics step at a time so it lands on the exact frame.
         g.owed += dt;
         const double step = 1.0 / TPS;
@@ -422,7 +423,7 @@ class $modify(BufferPL, PlayLayer) {
             PlayLayer::update(rest);
         }
     }
-
+ 
     void levelComplete() {
         auto& g = st();
         if (g.simulating) return;
