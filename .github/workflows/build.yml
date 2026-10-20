@@ -1,60 +1,46 @@
-{
-  "geode": "5.9.0",
-  "gd": {
-    "win": "2.2081"
-  },
-  "id": "spongeski.click-buffer",
-  "name": "Click Buffer",
-  "version": "v1.0.0",
-  "developer": "spongeski",
-  "description": "Buffers early clicks by simulating ahead, and clearly labels the run as assisted.",
-  "settings": {
-    "enabled": {
-      "type": "bool",
-      "name": "Enabled",
-      "description": "Turn the click buffer on or off.",
-      "default": true
-    },
-    "window": {
-      "type": "string",
-      "name": "Buffer window (frames)",
-      "description": "How many frames early a click can be and still get buffered (240 Hz physics frames).",
-      "default": "4",
-      "one-of": [
-        "2",
-        "4",
-        "8",
-        "16"
-      ]
-    },
-    "lookahead-ms": {
-      "type": "int",
-      "name": "Lookahead budget (ms)",
-      "description": "Max time spent simulating ahead per click. If it runs out, the click is left alone.",
-      "default": 6,
-      "min": 1,
-      "max": 30
-    },
-    "block-saving": {
-      "type": "bool",
-      "name": "Block saving assisted completions",
-      "description": "Completions that used retimed clicks are not saved.",
-      "default": true
-    },
-    "include-wave": {
-      "type": "bool",
-      "name": "Include wave (experimental)",
-      "description": "Also buffer clicks in wave. The lookahead assumes short taps, so results in wave are rough and may feel off.",
-      "default": false
-    },
-    "rescue-late": {
-      "type": "bool",
-      "name": "Rescue late clicks (experimental)",
-      "description": "If a click is a few frames too LATE, rewind the game up to the buffer window and apply it earlier. Heavier on performance and may glitch. Off by default.",
-      "default": false
-    }
-  },
-  "dependencies": {
-    "geode.node-ids": ">=v1.23.3"
-  }
-}
+name: Build Geode Mod
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: Windows
+            os: windows-latest
+
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the mod
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          bindings: geode-sdk/bindings
+          bindings-ref: main
+          combine: true
+          target: ${{ matrix.config.target }}
+
+  package:
+    name: Package builds
+    runs-on: ubuntu-latest
+    needs: ["build"]
+
+    steps:
+      - uses: geode-sdk/build-geode-mod/combine@main
+        id: build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build Output
+          path: ${{ steps.build.outputs.build-output }}
+          
