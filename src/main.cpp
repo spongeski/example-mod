@@ -1,21 +1,18 @@
 // Click Buffer
 // ---------------------------------------------------------------------------
-// A real-time input buffer with a distribution, instead of a rescue.
+// A real-time input buffer: early clicks snap to the nearest safe frame.
 //
 //   1. You press jump. The press is NOT applied right away.
 //   2. The mod snapshots the game and simulates a short way ahead, once for
 //      "click now" and then for "click 1 frame later", "2 frames later", ...
 //   3. If clicking now already works, the click is applied as normal (nothing changes).
-//   4. If clicking now fails but a later frame works, we have found the true window
-//      [a, b] (in frames after your click). You are only buffered if `a` is within
-//      your chosen window N (2 / 4 / 8 / 16) -- i.e. you were at most N frames early.
-//   5. The click is held in the buffer and released at a frame drawn from a
-//      distribution inside [a, b]:
-//          clicked as early as the buffer tolerates -> released on `a` (earliest frame)
-//          clicked just 1 frame early               -> somewhere in the early-middle
-//      so there is no single fixed "guardian angel" frame to find in a completion.
-//   6. The live game is restored to exactly where it was, and your click is released
-//      at the chosen frame. The matching release is delayed by the same amount.
+//   4. If clicking now fails but a later frame works, the click is moved to the NEAREST frame
+//      that keeps you alive -- but only if that frame is within your chosen window N (2 / 4 / 8 / 16),
+//      i.e. you were at most N frames early.
+//   5. The click is held in the buffer and released on that frame (the earliest safe one).
+//   6. The live game is restored to exactly where it was, and your click is applied
+//      at the chosen frame. Your release is NOT delayed: it happens when you let go
+//      (but never before the moved click).
 //
 // A label says this is NOT a real run, and (optionally) completions with a retimed
 // click are not saved.
@@ -47,13 +44,11 @@ constexpr int HORIZON = 110;           // how many frames ahead each lookahead s
 constexpr int TAP_FRAMES = 6;          // lookahead assumes the click is released after this many frames
 constexpr int MIN_IMPROVEMENT = 8;     // a later click must survive at least this many frames longer to count
 constexpr int SCORE_TOL = 3;           // tolerance when comparing "frames survived"
-constexpr int MAX_WINDOW_SCAN = 2;     // look at most MAX_WINDOW_SCAN * N frames past `a` for the end of the window
-constexpr double MEAN_FRAC = 0.40;     // 0 = earliest frame of window, 0.5 = dead middle. "early-middle" = 0.4
-constexpr double SPREAD_FRAC = 0.20;   // randomness of the landing spot (fraction of the window width)
  
 // ----- settings -------------------------------------------------------------
 bool bufferEnabled() { return Mod::get()->getSettingValue<bool>("enabled"); }
 bool blockSaving() { return Mod::get()->getSettingValue<bool>("block-saving"); }
+bool includeWave() { return Mod::get()->getSettingValue<bool>("include-wave"); }
 double lookaheadMs() { return static_cast<double>(Mod::get()->getSettingValue<int64_t>("lookahead-ms")); }
 int windowFrames() {
     int n = 4;
@@ -114,7 +109,8 @@ PlayLayer* livePlay(GJBaseGameLayer* layer) {
 bool tapMode(PlayLayer* pl) {
     auto p = pl->m_player1;
     if (!p) return false;
-    return !(p->m_isShip || p->m_isDart || p->m_isSwing || p->m_isRobot);
+    // Wave (m_isDart) is only included when the experimental setting is on.
+    return !(p->m_isShip || (p->m_isDart && !includeWave()) || p->m_isSwing || p->m_isRobot);
 }
  
 void addEvent(Event e) {
@@ -134,23 +130,6 @@ void fireDue(PlayLayer* pl) {
         pl->handleButton(e.down, 1, e.p1);
         g.firing = false;
     }
-}
- 
-// Pick the frame inside [a, b] the click is released on.
-// early = how many frames before the true window the player clicked (1..N).
-int pickTarget(int a, int b, int early, int N) {
-    if (b <= a) return a;
-    double W = static_cast<double>(b - a);
-    double frac = static_cast<double>(N - early) / static_cast<double>(N);  // 0 when clicked as early as allowed
-    double mean = a + frac * MEAN_FRAC * W;
-    double sd = frac * SPREAD_FRAC * W;
-    if (sd <= 0.0) return a;  // earliest possible click -> earliest frame
-    std::normal_distribution<double> dist(mean, sd);
-    for (int i = 0; i < 16; ++i) {
-        int r = static_cast<int>(std::llround(dist(st().rng)));
-        if (r >= a && r <= b) return r;
-    }
-    return std::clamp(static_cast<int>(std::llround(mean)), a, b);
 }
  
 // ----- lookahead simulation -------------------------------------------------
@@ -236,16 +215,9 @@ int planDelay(PlayLayer* pl, bool p1) {
             if (a < 0) break;
         }
  
-        // Phase 2: find where the window ends.
-        int b = a;
-        for (int d = a + 1; d <= a + MAX_WINDOW_SCAN * N; ++d) {
-            if (outOfTime()) break;  // keep the part of the window we already know
-            if (run(d) >= threshold) b = d;
-            else break;
-        }
- 
-        result = pickTarget(a, b, a, N);
-        log::debug("buffered click: window {}..{} frames after click, released on +{} (N={})", a, b, result, N);
+        // Snap to the nearest frame (after the click) that keeps you alive.
+        result = a;
+        log::debug("buffered click: nearest safe frame is +{} after the click (N={})", a, N);
     } while (false);
  
     // Put the live game back exactly where it was before the lookahead.
@@ -286,7 +258,8 @@ void showBanner() {
 }
  
 // ----- click handling -------------------------------------------------------
-void onPress(PlayLayer* pl, bool p1) {
+// Returns true if the click was taken over (buffered); false = let the game handle it right now.
+bool onPress(PlayLayer* pl, bool p1) {
     auto& g = st();
     int idx = p1 ? 0 : 1;
     int c0 = frameOf(pl);
@@ -300,23 +273,27 @@ void onPress(PlayLayer* pl, bool p1) {
     }
  
     g.lastDelay[idx] = delay;
+    if (delay <= 0) return false;  // nothing to fix: the click goes through untouched, with zero added lag
+ 
     g.lastStep[idx] = c0 + delay;
     addEvent({c0 + delay, true, p1});
- 
-    if (delay > 0) {
-        g.retimed++;
-        refreshLabel(pl);
-    }
+    g.retimed++;
+    refreshLabel(pl);
+    return true;
 }
  
-void onRelease(PlayLayer* pl, bool p1) {
+bool onRelease(PlayLayer* pl, bool p1) {
     auto& g = st();
     int idx = p1 ? 0 : 1;
     int c0 = frameOf(pl);
-    // keep the hold length: release is delayed by the same amount as its press, never before it
-    int step = std::max(c0 + g.lastDelay[idx], g.lastStep[idx] + 1);
+    // an un-delayed press with nothing pending: the release also goes straight through
+    if (g.lastDelay[idx] <= 0 && g.sched.empty()) return false;
+    // The release keeps its real timing (no extra delay), but never lands before the moved press.
+    int step = std::max(c0, g.lastStep[idx] + 1);
+    if (step <= c0 && g.sched.empty()) return false;  // the press already happened: release right now
     g.lastStep[idx] = step;
     addEvent({step, false, p1});
+    return true;
 }
  
 }  // namespace
@@ -338,8 +315,18 @@ class $modify(BufferBGL, GJBaseGameLayer) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
-        if (down) onPress(pl, isPlayer1);
-        else onRelease(pl, isPlayer1);
+        bool taken = down ? onPress(pl, isPlayer1) : onRelease(pl, isPlayer1);
+        if (!taken) GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
+ 
+    // Runs once per physics step: release buffered clicks on exactly the frame they were scheduled for.
+    void processCommands(float dt) {
+        auto& g = st();
+        if (!g.simulating && !g.sched.empty()) {
+            auto pl = PlayLayer::get();
+            if (pl && static_cast<GJBaseGameLayer*>(pl) == this) fireDue(pl);
+        }
+        GJBaseGameLayer::processCommands(dt);
     }
 };
  
@@ -395,33 +382,8 @@ class $modify(BufferPL, PlayLayer) {
  
     void update(float dt) {
         auto& g = st();
-        if (g.simulating) {
-            PlayLayer::update(dt);
-            return;
-        }
-        if (!bufferEnabled()) g.sched.clear();
- 
-        if (g.sched.empty()) {
-            // normal frame: hand back any time we were holding and run as usual
-            dt += static_cast<float>(g.owed);
-            g.owed = 0.0;
-            PlayLayer::update(dt);
-            return;
-        }
- 
-        // A click is buffered: advance one physics step at a time so it lands on the exact frame.
-        g.owed += dt;
-        const double step = 1.0 / TPS;
-        for (int guard = 0; guard < 512 && !g.sched.empty() && g.owed >= step; ++guard) {
-            fireDue(this);
-            PlayLayer::update(static_cast<float>(step));
-            g.owed -= step;
-        }
-        if (g.sched.empty() && g.owed > 0.0) {
-            float rest = static_cast<float>(g.owed);
-            g.owed = 0.0;
-            PlayLayer::update(rest);
-        }
+        if (!g.simulating && !bufferEnabled()) g.sched.clear();
+        PlayLayer::update(dt);
     }
  
     void levelComplete() {
