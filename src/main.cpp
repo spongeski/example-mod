@@ -10,6 +10,9 @@
 //      that keeps you alive -- but only if that frame is within your chosen window N (2 / 4 / 8 / 16),
 //      i.e. you were at most N frames early.
 //   5. The click is held in the buffer and released on that frame (the earliest safe one).
+//   5b. (Optional, experimental) If NO early fix exists, the mod also checks whether pressing up to N
+//      frames EARLIER would have survived. If so it rewinds the game to that frame, applies the click
+//      there, and replays forward to where you were. Needs a snapshot of every physics frame.
 //   6. The live game is restored to exactly where it was, and your click is applied
 //      at the chosen frame. Your release is NOT delayed: it happens when you let go
 //      (but never before the moved click).
@@ -49,6 +52,7 @@ constexpr int SCORE_TOL = 3;           // tolerance when comparing "frames survi
 bool bufferEnabled() { return Mod::get()->getSettingValue<bool>("enabled"); }
 bool blockSaving() { return Mod::get()->getSettingValue<bool>("block-saving"); }
 bool includeWave() { return Mod::get()->getSettingValue<bool>("include-wave"); }
+bool rescueLate() { return Mod::get()->getSettingValue<bool>("rescue-late"); }
 double lookaheadMs() { return static_cast<double>(Mod::get()->getSettingValue<int64_t>("lookahead-ms")); }
 int windowFrames() {
     int n = 4;
@@ -63,6 +67,12 @@ struct Event {
     bool p1;
 };
  
+struct Snap {
+    int frame;               // physics frame this snapshot was taken at (state BEFORE that frame ran)
+    double t;                // level time at that frame
+    CheckpointObject* cp;    // retained snapshot of the game
+};
+ 
 struct State {
     std::deque<Event> sched;   // buffered clicks waiting for their frame (sorted by step)
     double owed = 0.0;         // time we've taken from the engine while stepping manually
@@ -73,6 +83,9 @@ struct State {
     bool firing = false;       // true while WE are applying a buffered click (so our hook lets it through)
     bool simDied = false;
     int simDeathFrame = -1;
+ 
+    bool lateCandidate = false;  // last lookahead: clicking now fails and no EARLY fix exists
+    std::deque<Snap> history;    // rolling snapshots of the last few frames (late-click rescue only)
  
     int retimed = 0;
     std::mt19937 rng{std::random_device{}()};
@@ -88,8 +101,16 @@ int frameOf(GJBaseGameLayer* l) {
     return static_cast<int>(std::llround(l->m_gameState.m_levelTime * TPS));
 }
  
+void clearHistory() {
+    auto& g = st();
+    for (auto& sn : g.history)
+        if (sn.cp) sn.cp->release();
+    g.history.clear();
+}
+ 
 void resetRuntime() {
     auto& g = st();
+    clearHistory();
     g.sched.clear();
     g.owed = 0.0;
     g.lastStep[0] = g.lastStep[1] = -1000000;
@@ -159,6 +180,7 @@ int simulate(PlayLayer* pl, CheckpointObject* cp, double t0, int c0, std::vector
 // How many frames should the click that just arrived be delayed? (0 = leave it alone)
 int planDelay(PlayLayer* pl, bool p1) {
     auto& g = st();
+    g.lateCandidate = false;
     const int N = windowFrames();
     const int H = HORIZON;
     const int c0 = frameOf(pl);
@@ -184,9 +206,11 @@ int planDelay(PlayLayer* pl, bool p1) {
     };
  
     int result = 0;
+    g.lateCandidate = false;
     do {
         int s0 = run(0);
         if (s0 >= H) break;  // clicking right now is already fine
+        g.lateCandidate = true;  // clicking now fails; stays true unless an early fix is found
  
         // Phase 1: first delay (within the buffer window) that works.
         std::vector<int> sc(N + 1, 0);
@@ -201,6 +225,7 @@ int planDelay(PlayLayer* pl, bool p1) {
         }
         if (timedOut) {
             log::debug("lookahead ran out of time, click left alone");
+            g.lateCandidate = false;
             break;
         }
  
@@ -217,6 +242,7 @@ int planDelay(PlayLayer* pl, bool p1) {
  
         // Snap to the nearest frame (after the click) that keeps you alive.
         result = a;
+        g.lateCandidate = false;
         log::debug("buffered click: nearest safe frame is +{} after the click (N={})", a, N);
     } while (false);
  
@@ -225,6 +251,91 @@ int planDelay(PlayLayer* pl, bool p1) {
     pl->m_gameState.m_levelTime = t0;
     cp->release();
     return result;
+}
+ 
+// ----- late-click rescue (experimental) -------------------------------------
+// Take a snapshot of the game before every physics step (only while the setting is on),
+// keeping the last N+2 of them.
+void recordSnapshot(PlayLayer* pl) {
+    auto& g = st();
+    int f = frameOf(pl);
+    if (!g.history.empty() && g.history.back().frame >= f) clearHistory();  // time went backwards / repeated
+    CheckpointObject* cp = pl->createCheckpoint();
+    if (!cp) return;
+    cp->retain();
+    g.history.push_back({f, pl->m_gameState.m_levelTime, cp});
+    while (g.history.size() > static_cast<size_t>(windowFrames()) + 2) {
+        g.history.front().cp->release();
+        g.history.pop_front();
+    }
+}
+ 
+Snap* findSnap(int frame) {
+    for (auto& sn : st().history)
+        if (sn.frame == frame) return &sn;
+    return nullptr;
+}
+ 
+// Would the click have survived if it had been pressed j frames ago? Returns the smallest such j
+// (1..N), or 0 if none. The live game is left exactly as it was found when the result is 0.
+int planLate(PlayLayer* pl, bool p1) {
+    auto& g = st();
+    if (!g.sched.empty() || g.history.empty()) return 0;
+    const int N = windowFrames();
+    const int H = HORIZON;
+    const int c0 = frameOf(pl);
+ 
+    CheckpointObject* cp0 = pl->createCheckpoint();
+    if (!cp0) return 0;
+    cp0->retain();
+    const double t0 = pl->m_gameState.m_levelTime;
+ 
+    const auto start = std::chrono::steady_clock::now();
+    const double budget = lookaheadMs();
+ 
+    int found = 0;
+    for (int j = 1; j <= N; ++j) {
+        if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budget) break;
+        Snap* sn = findSnap(c0 - j);
+        if (!sn) continue;
+        std::vector<Event> ev;
+        ev.push_back({sn->frame, true, p1});
+        ev.push_back({sn->frame + TAP_FRAMES, false, p1});
+        if (simulate(pl, sn->cp, sn->t, sn->frame, ev, H) >= H) { found = j; break; }
+    }
+ 
+    if (found == 0) {
+        pl->loadFromCheckpoint(cp0);
+        pl->m_gameState.m_levelTime = t0;
+    }
+    cp0->release();
+    return found;
+}
+ 
+// Rewind the live game j frames, press on that frame, then run forward again to where we were.
+bool applyLate(PlayLayer* pl, bool p1, int j) {
+    auto& g = st();
+    const int c0 = frameOf(pl);
+    Snap* sn = findSnap(c0 - j);
+    if (!sn) return false;
+ 
+    g.simulating = true;  // our hooks stay out of the way (and no death is triggered) during the replay
+    g.simDied = false;
+    g.simDeathFrame = -1;
+ 
+    pl->loadFromCheckpoint(sn->cp);
+    pl->m_gameState.m_levelTime = sn->t;
+ 
+    g.firing = true;
+    pl->handleButton(true, 1, p1);
+    g.firing = false;
+ 
+    for (int guard = 0; guard < j * 4 + 8 && !g.simDied && frameOf(pl) < c0; ++guard)
+        pl->update(1.f / static_cast<float>(TPS));
+ 
+    g.simulating = false;
+    clearHistory();  // those snapshots belong to the old timeline
+    return true;
 }
  
 // ----- UI -------------------------------------------------------------------
@@ -270,6 +381,15 @@ bool onPress(PlayLayer* pl, bool p1) {
         delay = g.lastStep[idx] + 1 - c0;
     } else if (tapMode(pl)) {
         delay = planDelay(pl, p1);
+        if (delay <= 0 && g.lateCandidate && rescueLate()) {
+            int j = planLate(pl, p1);
+            if (j > 0 && applyLate(pl, p1, j)) {
+                g.lastDelay[idx] = 0;
+                g.retimed++;
+                refreshLabel(pl);
+                return true;  // the click was applied inside the rewind
+            }
+        }
     }
  
     g.lastDelay[idx] = delay;
@@ -322,9 +442,9 @@ class $modify(BufferBGL, GJBaseGameLayer) {
     // Runs once per physics step: release buffered clicks on exactly the frame they were scheduled for.
     void processCommands(float dt) {
         auto& g = st();
-        if (!g.simulating && !g.sched.empty()) {
-            auto pl = PlayLayer::get();
-            if (pl && static_cast<GJBaseGameLayer*>(pl) == this) fireDue(pl);
+        if (auto pl = livePlay(this)) {
+            if (!g.sched.empty()) fireDue(pl);
+            if (rescueLate()) recordSnapshot(pl);
         }
         GJBaseGameLayer::processCommands(dt);
     }
